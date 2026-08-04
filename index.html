@@ -1,0 +1,980 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#1d2733">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-title" content="レジ締め">
+<title>桃谷本店 レジ締め・営業日報</title>
+<style>
+  html,body{margin:0;padding:0;-webkit-text-size-adjust:100%}
+  #root{min-height:100vh}
+  .boot{display:grid;place-items:center;height:100vh;font-family:sans-serif;color:#5a6674;font-size:13px}
+</style>
+<script src="https://unpkg.com/react@18/umd/react.production.min.js" crossorigin></script>
+<script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js" crossorigin></script>
+<script src="https://unpkg.com/@babel/standalone@7/babel.min.js" crossorigin></script>
+</head>
+<body>
+<div id="root"><div class="boot">読み込んでいます…</div></div>
+
+<script type="text/babel" data-presets="react">
+/* この端末の中にだけデータを保存します（サーバーには送りません） */
+const store = {
+  async list(prefix){
+    const keys = Object.keys(localStorage).filter(k => k.startsWith(prefix));
+    return { keys };
+  },
+  async set(key, value){ localStorage.setItem(key, value); return { key, value }; },
+  async get(key){
+    const value = localStorage.getItem(key);
+    if (value === null) throw new Error("not found");
+    return { key, value };
+  },
+  async delete(key){ localStorage.removeItem(key); return { key, deleted:true }; }
+};
+
+const { useState, useEffect, useMemo, useRef } = React;
+
+/* ─────────────────────────────────────────────
+   桃谷本店 レジ締め → 営業日報
+   入力（赤枠）だけ埋めれば日報が完成します
+   ───────────────────────────────────────────── */
+
+const ROLLS = [
+  { key: "r500", label: "500円", per: 25000 },
+  { key: "r100", label: "100円", per: 5000 },
+  { key: "r50", label: "50円", per: 2500 },
+  { key: "r10", label: "10円", per: 500 },
+  { key: "r5", label: "5円", per: 250 },
+  { key: "r1", label: "1円", per: 50 },
+];
+
+const POINT_UNIT = 300; // ポイントカード1枚あたりの金券額
+const DEFAULT_FUND = 300000; // 釣り銭準備金
+
+const todayISO = () => {
+  const d = new Date();
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(
+    d.getDate()
+  ).padStart(2, "0")}`;
+};
+
+const blank = () => ({
+  date: todayISO(),
+  weather: "",
+  receiptTotal: "",
+  bagSales: "",
+  bills: "",
+  coins: ["", "", ""],
+  shopReceipt: ["", "", ""],
+  rolls: { r500: "", r100: "", r50: "", r10: "", r5: "", r1: "" },
+  points: "",
+  credit: "",
+  icoca: "",
+  paypay: "",
+  offline: "",
+  transfer: "",
+  guests: "",
+  fund: String(DEFAULT_FUND),
+  lastYearSales: "",
+  lastYearGuests: "",
+  lastYearCum: "",
+  thisYearCum: "",
+  staff: [{ name: "", from: "", to: "" }],
+  note: "",
+  writer: "",
+});
+
+const n = (v) => {
+  const x = parseFloat(String(v).replace(/[^\d.-]/g, ""));
+  return isNaN(x) ? 0 : x;
+};
+const yen = (v) => (v === 0 ? "0" : v.toLocaleString("ja-JP"));
+
+/* 旧データ（1項目だけ）も配列として扱えるようにする */
+const arr3 = (v) => {
+  if (Array.isArray(v)) return [v[0] ?? "", v[1] ?? "", v[2] ?? ""];
+  return [v ?? "", "", ""];
+};
+const sum3 = (v) => arr3(v).reduce((s, x) => s + n(x), 0);
+
+const WEEK = ["日", "月", "火", "水", "木", "金", "土"];
+const jpDate = (iso) => {
+  if (!iso) return { r: "", m: "", d: "", w: "", y: "" };
+  const [y, m, d] = iso.split("-").map(Number);
+  const dt = new Date(y, m - 1, d);
+  return { r: y - 2018, y, m, d, w: WEEK[dt.getDay()] };
+};
+const lastYearISO = (iso) => {
+  if (!iso) return "";
+  const [y, m, d] = iso.split("-").map(Number);
+  return `${y - 1}-${String(m).padStart(2, "0")}-${String(d).padStart(2, "0")}`;
+};
+
+function App() {
+  const [tab, setTab] = useState("input");
+  const [f, setF] = useState(blank());
+  const [saved, setSaved] = useState([]);
+  const [status, setStatus] = useState("");
+  const statusTimer = useRef(null);
+
+  const set = (k) => (e) => setF((p) => ({ ...p, [k]: e.target.value }));
+  const setRoll = (k) => (e) =>
+    setF((p) => ({ ...p, rolls: { ...p.rolls, [k]: e.target.value } }));
+  const setAt = (k, i) => (e) =>
+    setF((p) => {
+      const a = arr3(p[k]);
+      a[i] = e.target.value;
+      return { ...p, [k]: a };
+    });
+
+  const flash = (msg) => {
+    setStatus(msg);
+    clearTimeout(statusTimer.current);
+    statusTimer.current = setTimeout(() => setStatus(""), 2600);
+  };
+
+  /* ── 計算 ── */
+  const c = useMemo(() => {
+    const rollTotal = ROLLS.reduce((s, r) => s + r.per * n(f.rolls[r.key]), 0);
+    const cashless = n(f.credit) + n(f.icoca) + n(f.paypay) + n(f.offline);
+    const gift = n(f.points) * POINT_UNIT;
+    const fund = n(f.fund);
+    const shopTotal = sum3(f.shopReceipt);
+    const coinTotal = sum3(f.coins);
+    const counted =
+      n(f.bills) + coinTotal + shopTotal + rollTotal + cashless + gift - fund;
+
+    const receipt = n(f.receiptTotal);
+    const diff = counted - receipt;
+    const sabiki1 = receipt + diff;
+
+    const expense = shopTotal + cashless + gift;
+    const cash = sabiki1 - expense;
+    const toHQ = cash - n(f.transfer);
+
+    const totalIncl = sabiki1;
+    const bagIncl = Math.min(Math.max(n(f.bagSales), 0), Math.max(totalIncl, 0));
+    const foodIncl = totalIncl - bagIncl;
+    const A = foodIncl > 0 ? Math.floor(foodIncl / 1.08) : 0;
+    const tax8 = foodIncl - A;
+    const B = bagIncl > 0 ? Math.floor(bagIncl / 1.1) : 0;
+    const tax10 = bagIncl - B;
+
+    const lyS = n(f.lastYearSales);
+    const lyG = n(f.lastYearGuests);
+    const guests = n(f.guests);
+
+    return {
+      shopTotal,
+      coinTotal,
+      rollTotal,
+      cashless,
+      gift,
+      fund,
+      counted,
+      receipt,
+      diff,
+      plus: diff > 0 ? diff : 0,
+      minus: diff < 0 ? -diff : 0,
+      sabiki1,
+      expense,
+      cash,
+      toHQ,
+      totalIncl,
+      bagIncl,
+      foodIncl,
+      A,
+      tax8,
+      B,
+      tax10,
+      net: A + B,
+      guests,
+      salesRatio: lyS > 0 ? ((A + B) / lyS) * 100 : null,
+      guestRatio: lyG > 0 ? (guests / lyG) * 100 : null,
+      cumRatio:
+        n(f.lastYearCum) > 0 ? (n(f.thisYearCum) / n(f.lastYearCum)) * 100 : null,
+    };
+  }, [f]);
+
+  /* ── 保存・読込 ── */
+  const loadIndex = async () => {
+    try {
+      const r = await store.list("nippo:");
+      if (r && r.keys) setSaved(r.keys.map((k) => k.replace("nippo:", "")).sort().reverse());
+    } catch (e) {
+      /* まだ保存がない */
+    }
+  };
+  useEffect(() => {
+    loadIndex();
+  }, []);
+
+  const save = async () => {
+    if (!f.date) return flash("日付を入れてください");
+    try {
+      await store.set(`nippo:${f.date}`, JSON.stringify(f));
+      await loadIndex();
+      flash(`${f.date} を保存しました`);
+    } catch (e) {
+      flash("保存できませんでした。もう一度お試しください");
+    }
+  };
+
+  const load = async (date) => {
+    if (!date) return;
+    try {
+      const r = await store.get(`nippo:${date}`);
+      const data = JSON.parse(r.value);
+      setF({
+        ...blank(),
+        ...data,
+        rolls: { ...blank().rolls, ...(data.rolls || {}) },
+        shopReceipt: arr3(data.shopReceipt),
+        coins: arr3(data.coins),
+      });
+      flash(`${date} を読み込みました`);
+    } catch (e) {
+      flash("そのデータは読み込めませんでした");
+    }
+  };
+
+  const reset = () => {
+    setF(blank());
+    flash("新しい日報を作成します");
+  };
+
+  const jd = jpDate(f.date);
+  const ljd = jpDate(lastYearISO(f.date));
+  const diffOK = Math.abs(c.diff) <= 1000;
+
+  return (
+    <div className="app">
+      <style>{CSS}</style>
+
+      <header className="bar no-print">
+        <div className="brand">
+          <span className="mark">桃</span>
+          <div>
+            <div className="t1">桃谷本店　レジ締め</div>
+            <div className="t2">入力すると営業日報ができます</div>
+          </div>
+        </div>
+        <nav className="tabs">
+          <button className={tab === "input" ? "tab on" : "tab"} onClick={() => setTab("input")}>
+            入力
+          </button>
+          <button className={tab === "report" ? "tab on" : "tab"} onClick={() => setTab("report")}>
+            日報
+          </button>
+        </nav>
+      </header>
+
+      {status && <div className="toast no-print">{status}</div>}
+
+      {tab === "input" ? (
+        <main className="wrap no-print">
+          {/* 日付 */}
+          <section className="card">
+            <h2>この日の情報</h2>
+            <div className="grid2">
+              <Field label="営業日">
+                <input type="date" value={f.date} onChange={set("date")} />
+              </Field>
+              <Field label="天候">
+                <div className="segs">
+                  {["晴", "曇り", "雨"].map((w) => (
+                    <button
+                      key={w}
+                      className={f.weather === w ? "seg on" : "seg"}
+                      onClick={() => setF((p) => ({ ...p, weather: p.weather === w ? "" : w }))}
+                    >
+                      {w}
+                    </button>
+                  ))}
+                </div>
+              </Field>
+            </div>
+          </section>
+
+          {/* レシートの数値 */}
+          <section className="card red">
+            <h2>
+              レシートの数値<span className="hint">レジ精算レポートから</span>
+            </h2>
+            <Money label="レシート総売上（税込）" v={f.receiptTotal} on={set("receiptTotal")} big />
+            <div className="triple">
+              <span className="fl">お買い物レシート（材料・その他）</span>
+              <div className="grid3">
+                {["❶", "❷", "❸"].map((mk, i) => (
+                  <Money
+                    key={mk}
+                    label={mk}
+                    v={arr3(f.shopReceipt)[i]}
+                    on={setAt("shopReceipt", i)}
+                  />
+                ))}
+              </div>
+              <div className="tsum">
+                3枚合計 <b>{yen(c.shopTotal)}</b> 円
+              </div>
+            </div>
+            <div className="grid3">
+              <Money label="クレジット" v={f.credit} on={set("credit")} />
+              <Money label="ICOCA" v={f.icoca} on={set("icoca")} />
+              <Money label="PayPay（QR）" v={f.paypay} on={set("paypay")} />
+              <Money label="オフライン" v={f.offline} on={set("offline")} />
+              <Money label="ポイントカード" v={f.points} on={set("points")} unit="枚" />
+              <Money label="客数" v={f.guests} on={set("guests")} unit="人" />
+            </div>
+            <div className="sub">
+              キャッシュレス計 <b>{yen(c.cashless)}</b> 円　／　金券（{POINT_UNIT}円×
+              {n(f.points)}枚） <b>{yen(c.gift)}</b> 円
+            </div>
+          </section>
+
+          {/* 袋の売上 */}
+          <section className="card red">
+            <h2>
+              袋の売上<span className="hint">税率10%で自動計算</span>
+            </h2>
+            <Money label="袋売上（税込）" v={f.bagSales} on={set("bagSales")} big />
+            <div className="sub">
+              税抜 <b>{yen(c.B)}</b> 円　＋　消費税10% <b>{yen(c.tax10)}</b> 円
+              <br />
+              総売上からこの金額を引いた分を、8%の食品売上として計算します。
+            </div>
+          </section>
+
+          {/* 数えたお金 */}
+          <section className="card red">
+            <h2>
+              数えたお金<span className="hint">レジから出したもの</span>
+            </h2>
+            <Money label="札束金額" v={f.bills} on={set("bills")} />
+            <div className="triple">
+              <span className="fl">端数の小銭金額</span>
+              <div className="grid3">
+                {["レジ❶", "レジ❷", "レジ❸"].map((mk, i) => (
+                  <Money key={mk} label={mk} v={arr3(f.coins)[i]} on={setAt("coins", i)} />
+                ))}
+              </div>
+              <div className="tsum">
+                3台合計 <b>{yen(c.coinTotal)}</b> 円
+              </div>
+            </div>
+            <h3>棒金　本数</h3>
+            <div className="rolls">
+              {ROLLS.map((r) => (
+                <label key={r.key} className="roll">
+                  <span className="rl">{r.label}</span>
+                  <input
+                    type="number"
+                    inputMode="numeric"
+                    placeholder="0"
+                    value={f.rolls[r.key]}
+                    onChange={setRoll(r.key)}
+                  />
+                  <span className="ru">本</span>
+                  <span className="rv">{yen(r.per * n(f.rolls[r.key]))}</span>
+                </label>
+              ))}
+            </div>
+            <div className="sub">
+              棒金合計 <b>{yen(c.rollTotal)}</b> 円
+            </div>
+          </section>
+
+          {/* 差額 */}
+          <section className={diffOK ? "card okbox" : "card ngbox"}>
+            <div className="diffrow">
+              <div>
+                <div className="dl">差額（数えたお金 − レシート総売上）</div>
+                <div className="dv">
+                  {c.diff > 0 ? "＋" : c.diff < 0 ? "−" : ""}
+                  {yen(Math.abs(c.diff))} <small>円</small>
+                </div>
+              </div>
+              <div className="dnote">
+                {diffOK ? "許容範囲です" : "1,000円以上ずれています。もう一度数えてください"}
+              </div>
+            </div>
+            <div className="sub">
+              数えたお金 {yen(c.counted)} 円（釣り銭準備金 {yen(c.fund)} 円を差引後）
+            </div>
+          </section>
+
+          {/* 入金・その他 */}
+          <section className="card">
+            <h2>入金・その他</h2>
+            <div className="grid2">
+              <Money label="振込分" v={f.transfer} on={set("transfer")} />
+              <Money label="釣り銭準備金" v={f.fund} on={set("fund")} />
+              <Money label="昨年同日の売上金額" v={f.lastYearSales} on={set("lastYearSales")} />
+              <Money label="昨年同日の売上人員" v={f.lastYearGuests} on={set("lastYearGuests")} unit="人" />
+              <Money label="昨年の当月累計" v={f.lastYearCum} on={set("lastYearCum")} />
+              <Money label="今年の当月累計" v={f.thisYearCum} on={set("thisYearCum")} />
+            </div>
+          </section>
+
+          {/* 勤務状況 */}
+          <section className="card">
+            <h2>勤務状況</h2>
+            {f.staff.map((s, i) => (
+              <div className="staffrow" key={i}>
+                <input
+                  placeholder="氏名"
+                  value={s.name}
+                  onChange={(e) =>
+                    setF((p) => {
+                      const a = [...p.staff];
+                      a[i] = { ...a[i], name: e.target.value };
+                      return { ...p, staff: a };
+                    })
+                  }
+                />
+                <input
+                  placeholder="開始"
+                  value={s.from}
+                  onChange={(e) =>
+                    setF((p) => {
+                      const a = [...p.staff];
+                      a[i] = { ...a[i], from: e.target.value };
+                      return { ...p, staff: a };
+                    })
+                  }
+                />
+                <span className="tilde">〜</span>
+                <input
+                  placeholder="終了"
+                  value={s.to}
+                  onChange={(e) =>
+                    setF((p) => {
+                      const a = [...p.staff];
+                      a[i] = { ...a[i], to: e.target.value };
+                      return { ...p, staff: a };
+                    })
+                  }
+                />
+                <button
+                  className="x"
+                  onClick={() =>
+                    setF((p) => ({
+                      ...p,
+                      staff: p.staff.length > 1 ? p.staff.filter((_, j) => j !== i) : p.staff,
+                    }))
+                  }
+                >
+                  ×
+                </button>
+              </div>
+            ))}
+            <button
+              className="ghost"
+              onClick={() => setF((p) => ({ ...p, staff: [...p.staff, { name: "", from: "", to: "" }] }))}
+            >
+              ＋ 人を追加
+            </button>
+            <div className="grid2" style={{ marginTop: 14 }}>
+              <Field label="記入者">
+                <input value={f.writer} onChange={set("writer")} placeholder="氏名" />
+              </Field>
+              <Field label="備考">
+                <input value={f.note} onChange={set("note")} placeholder="申し送りなど" />
+              </Field>
+            </div>
+          </section>
+
+          {/* 結果サマリー */}
+          <section className="card sum">
+            <h2>集計</h2>
+            <Row l="レジ合計（税込）" v={c.receipt} />
+            <Row l="プラス（＋）" v={c.plus} />
+            <Row l="マイナス（−）" v={c.minus} />
+            <Row l="差引①" v={c.sabiki1} strong />
+            <Row l="支出　合計②" v={c.expense} />
+            <Row l="現金　①−②" v={c.cash} />
+            <Row l="振込分" v={n(f.transfer)} />
+            <Row l="差引本社入金額" v={c.toHQ} strong />
+            <hr />
+            <Row l="Ａ　販売（税抜・8%）" v={c.A} />
+            <Row l="Ｂ　食品以外（税抜・10%）" v={c.B} />
+            <Row l="本日の売上（税抜）Ａ＋Ｂ" v={c.net} strong />
+          </section>
+
+          <div className="actions">
+            <button className="primary" onClick={save}>
+              保存する
+            </button>
+            <button className="primary alt" onClick={() => setTab("report")}>
+              日報を見る
+            </button>
+            <button className="ghost" onClick={reset}>
+              新規作成
+            </button>
+            <select className="hist" value="" onChange={(e) => load(e.target.value)}>
+              <option value="">保存した日を開く</option>
+              {saved.map((d) => (
+                <option key={d} value={d}>
+                  {d}
+                </option>
+              ))}
+            </select>
+          </div>
+          <p className="foot">
+            保存したデータはこの端末のこのアプリ内にだけ残ります。
+          </p>
+        </main>
+      ) : (
+        <main className="wrap">
+          <div className="actions no-print">
+            <button className="primary" onClick={() => window.print()}>
+              印刷する
+            </button>
+            <button className="ghost" onClick={() => setTab("input")}>
+              入力に戻る
+            </button>
+          </div>
+
+          {/* ── 日報 ── */}
+          <div className="sheet">
+            <div className="sh-head">
+              <div className="sh-title">
+                <span className="store">桃谷</span>
+                <span className="small">店</span>
+                <span className="ttl">営業日報</span>
+              </div>
+              <table className="chk">
+                <tbody>
+                  <tr>
+                    <td>社長</td>
+                    <td>検算</td>
+                  </tr>
+                  <tr>
+                    <td className="h" />
+                    <td className="h" />
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+            <div className="sh-date">
+              令和 <u>{jd.r}</u> 年 <u>{jd.m}</u> 月 <u>{jd.d}</u> 日（<u>{jd.w}</u>）　天候（
+              {["晴", "曇り", "雨"].map((w, i) => (
+                <span key={w} className={f.weather === w ? "wsel" : ""}>
+                  {i > 0 ? "・" : ""}
+                  {w}
+                </span>
+              ))}
+              ）
+            </div>
+
+            <div className="cols">
+              <div className="colL">
+                <div className="cap">昨年の今日の売上状況</div>
+                <table className="tb">
+                  <tbody>
+                    <tr>
+                      <th colSpan={2} className="c">
+                        {ljd.r} 年 {ljd.m} 月 {ljd.d} 日 {ljd.w} 曜日
+                      </th>
+                    </tr>
+                    <tr>
+                      <th>売上金額</th>
+                      <td className="num">{f.lastYearSales ? yen(n(f.lastYearSales)) : ""}</td>
+                    </tr>
+                    <tr>
+                      <th>売上人員</th>
+                      <td className="num">
+                        {f.lastYearGuests ? `${yen(n(f.lastYearGuests))} 人` : "人"}
+                      </td>
+                    </tr>
+                    <tr>
+                      <th>客数　前年対比</th>
+                      <td className="num">
+                        {c.guestRatio != null ? `${c.guestRatio.toFixed(1)} %` : ""}
+                      </td>
+                    </tr>
+                  </tbody>
+                </table>
+
+                <div className="cap">本日の入金状況</div>
+                <table className="tb">
+                  <tbody>
+                    <tr>
+                      <th colSpan={2}>レジ合計（消費税含む）</th>
+                      <td className="num">{yen(c.receipt)}</td>
+                    </tr>
+                    <tr>
+                      <th colSpan={2}>プラス　（＋）</th>
+                      <td className="num">{c.plus ? yen(c.plus) : ""}</td>
+                    </tr>
+                    <tr>
+                      <th colSpan={2}>マイナス　（−）</th>
+                      <td className="num">{c.minus ? yen(c.minus) : ""}</td>
+                    </tr>
+                    <tr>
+                      <th colSpan={2}>差引①</th>
+                      <td className="num b">{yen(c.sabiki1)}</td>
+                    </tr>
+                    <tr>
+                      <th rowSpan={7} className="vert">
+                        支出明細
+                      </th>
+                      <th>材料・その他</th>
+                      <td className="num">{yen(c.shopTotal)}</td>
+                    </tr>
+                    <tr>
+                      <th>クレジットカード</th>
+                      <td className="num">{yen(n(f.credit))}</td>
+                    </tr>
+                    <tr>
+                      <th>ICOCA（電子マネー）</th>
+                      <td className="num">{yen(n(f.icoca))}</td>
+                    </tr>
+                    <tr>
+                      <th>paypay（QR決済）</th>
+                      <td className="num">{yen(n(f.paypay))}</td>
+                    </tr>
+                    <tr>
+                      <th>その他（オフライン）</th>
+                      <td className="num">{yen(n(f.offline))}</td>
+                    </tr>
+                    <tr>
+                      <th>金券　他</th>
+                      <td className="num">{yen(c.gift)}</td>
+                    </tr>
+                    <tr>
+                      <th>合　計</th>
+                      <td className="num b">{yen(c.expense)}</td>
+                    </tr>
+                    <tr>
+                      <th colSpan={2}>差引本社入金額</th>
+                      <td className="num b">¥ {yen(c.toHQ)}</td>
+                    </tr>
+                  </tbody>
+                </table>
+              </div>
+
+              <div className="colR">
+                <div className="cap">勤務状況</div>
+                <table className="tb staff">
+                  <tbody>
+                    <tr>
+                      <th colSpan={2}>販売者及び製造者名（勤務時間）</th>
+                    </tr>
+                    {Array.from({ length: 12 }).map((_, i) => {
+                      const a = f.staff[i * 2];
+                      const b = f.staff[i * 2 + 1];
+                      return (
+                        <tr key={i}>
+                          <td>{cellStaff(a)}</td>
+                          <td>{cellStaff(b)}</td>
+                        </tr>
+                      );
+                    })}
+                  </tbody>
+                </table>
+              </div>
+            </div>
+
+            <div className="cols">
+              <div className="colL">
+                <div className="cap">〈販売〉本日の売上高</div>
+                <table className="tb">
+                  <tbody>
+                    <tr>
+                      <th>売上（税込）</th>
+                      <td className="num">{yen(c.foodIncl)}</td>
+                    </tr>
+                    <tr>
+                      <th>消費税8%</th>
+                      <td className="num">{yen(c.tax8)}</td>
+                    </tr>
+                    <tr>
+                      <th className="b">Ａ　売上（税抜）</th>
+                      <td className="num b">{yen(c.A)}</td>
+                    </tr>
+                  </tbody>
+                </table>
+                <div className="note">※ 過不足は8%の売上にプラス、マイナス</div>
+              </div>
+              <div className="colR">
+                <div className="cap">〈食品以外〉本日の売上高</div>
+                <table className="tb">
+                  <tbody>
+                    <tr>
+                      <th>売上（税込）</th>
+                      <td className="num">{c.bagIncl ? yen(c.bagIncl) : ""}</td>
+                    </tr>
+                    <tr>
+                      <th>消費税10%</th>
+                      <td className="num">{c.bagIncl ? yen(c.tax10) : ""}</td>
+                    </tr>
+                    <tr>
+                      <th className="b">Ｂ　売上（税抜）</th>
+                      <td className="num b">{c.bagIncl ? yen(c.B) : ""}</td>
+                    </tr>
+                  </tbody>
+                </table>
+              </div>
+            </div>
+
+            <div className="cols">
+              <div className="colL">
+                <div className="cap">
+                  昨年と今年の本日迄の売上累計（　{jd.m} 月分）
+                </div>
+                <table className="tb">
+                  <tbody>
+                    <tr>
+                      <th>昨年の　{jd.m} 月分の累計</th>
+                      <td className="num">
+                        ¥ {f.lastYearCum ? yen(n(f.lastYearCum)) : ""}
+                      </td>
+                    </tr>
+                    <tr>
+                      <th>今年の　{jd.m} 月分の累計</th>
+                      <td className="num">
+                        ¥ {f.thisYearCum ? yen(n(f.thisYearCum)) : ""}
+                      </td>
+                    </tr>
+                    <tr>
+                      <th>売上　前年対比</th>
+                      <td className="num">
+                        {c.cumRatio != null ? `${c.cumRatio.toFixed(1)} %` : ""}
+                      </td>
+                    </tr>
+                  </tbody>
+                </table>
+              </div>
+              <div className="colR">
+                <div className="total">
+                  <div className="tl">本日の売上（税抜）Ａ＋Ｂ</div>
+                  <div className="tv">¥ {yen(c.net)}</div>
+                </div>
+                <table className="tb">
+                  <tbody>
+                    <tr>
+                      <th>合計売上対象人員</th>
+                      <td className="num">{c.guests ? `${yen(c.guests)} 人` : "人"}</td>
+                    </tr>
+                  </tbody>
+                </table>
+              </div>
+            </div>
+
+            <table className="tb memo">
+              <tbody>
+                <tr>
+                  <td className="memoc">{f.note}</td>
+                </tr>
+                <tr>
+                  <td className="memoc" />
+                </tr>
+                <tr>
+                  <td className="memoc" />
+                </tr>
+                <tr>
+                  <td className="memoc r">【記入者　{f.writer}　】</td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
+        </main>
+      )}
+    </div>
+  );
+}
+
+function cellStaff(s) {
+  if (!s || (!s.name && !s.from && !s.to)) return "（　　〜　　）";
+  return `${s.name}（${s.from || "　"}〜${s.to || "　"}）`;
+}
+
+function Field({ label, children }) {
+  return (
+    <label className="field">
+      <span className="fl">{label}</span>
+      {children}
+    </label>
+  );
+}
+
+function Money({ label, v, on, unit = "円", big }) {
+  return (
+    <label className={big ? "field money big" : "field money"}>
+      <span className="fl">{label}</span>
+      <span className="mi">
+        <input type="number" inputMode="numeric" placeholder="0" value={v} onChange={on} />
+        <span className="mu">{unit}</span>
+      </span>
+    </label>
+  );
+}
+
+function Row({ l, v, strong }) {
+  return (
+    <div className={strong ? "srow st" : "srow"}>
+      <span>{l}</span>
+      <span className="sv">{yen(v)}</span>
+    </div>
+  );
+}
+
+const CSS = `
+*{box-sizing:border-box}
+.app{
+  --ink:#1d2733; --ink2:#5a6674; --paper:#f7f5f0; --card:#ffffff;
+  --rule:#d9d3c6; --red:#b3352c; --redbg:#fdf3f1; --gold:#c9a227;
+  --ok:#2f7d5b; --okbg:#f0f7f3; --ngbg:#fdf1ef;
+  font-family:"Hiragino Sans","Hiragino Kaku Gothic ProN","Yu Gothic",Meiryo,sans-serif;
+  color:var(--ink); background:var(--paper); min-height:100vh;
+  font-feature-settings:"palt";
+}
+.app input,.app select,.app button{font-family:inherit}
+.bar{position:sticky;top:0;z-index:20;display:flex;align-items:center;justify-content:space-between;
+  gap:12px;padding:10px 14px;background:#fffdf8;border-bottom:1px solid var(--rule)}
+.brand{display:flex;align-items:center;gap:10px}
+.mark{display:grid;place-items:center;width:34px;height:34px;border-radius:4px;
+  background:var(--ink);color:#fff;font-size:17px;font-weight:600;letter-spacing:0}
+.t1{font-size:15px;font-weight:700;letter-spacing:.04em}
+.t2{font-size:11px;color:var(--ink2)}
+.tabs{display:flex;background:#efeadf;border-radius:6px;padding:3px}
+.tab{border:0;background:transparent;padding:7px 16px;border-radius:4px;font-size:13px;
+  font-weight:600;color:var(--ink2);cursor:pointer}
+.tab.on{background:#fff;color:var(--ink);box-shadow:0 1px 2px rgba(0,0,0,.12)}
+.toast{position:fixed;left:50%;transform:translateX(-50%);bottom:22px;z-index:50;
+  background:var(--ink);color:#fff;padding:10px 18px;border-radius:20px;font-size:13px}
+.wrap{max-width:860px;margin:0 auto;padding:14px 14px 60px}
+.card{background:var(--card);border:1px solid var(--rule);border-radius:8px;
+  padding:14px;margin-bottom:12px}
+.card.red{border-left:4px solid var(--red)}
+.card h2{margin:0 0 12px;font-size:13px;font-weight:700;letter-spacing:.1em;
+  display:flex;align-items:baseline;gap:10px}
+.card h3{margin:16px 0 8px;font-size:12px;font-weight:700;color:var(--ink2);letter-spacing:.08em}
+.hint{font-size:11px;font-weight:400;color:var(--ink2);letter-spacing:0}
+.grid2{display:grid;grid-template-columns:1fr 1fr;gap:10px}
+.grid3{display:grid;grid-template-columns:1fr 1fr;gap:10px}
+@media(min-width:640px){.grid3{grid-template-columns:1fr 1fr 1fr}}
+.field{display:block;margin-bottom:10px}
+.fl{display:block;font-size:11.5px;color:var(--ink2);margin-bottom:4px}
+.field input,.field select{width:100%;border:1px solid var(--rule);border-radius:5px;
+  padding:9px 10px;font-size:16px;background:#fff;color:var(--ink)}
+.field input:focus{outline:2px solid var(--gold);outline-offset:0;border-color:var(--gold)}
+.money .mi{display:flex;align-items:center;border:1.5px solid var(--red);border-radius:5px;
+  background:var(--redbg);overflow:hidden}
+.money .mi input{border:0;background:transparent;text-align:right;
+  font-variant-numeric:tabular-nums;font-weight:600;border-radius:0}
+.money .mi input:focus{outline:none}
+.money .mi:focus-within{box-shadow:0 0 0 2px rgba(179,53,44,.22)}
+.money .mu{padding:0 10px;font-size:12px;color:var(--ink2)}
+.money.big .mi input{font-size:21px;padding:12px 10px}
+.triple{margin-bottom:12px;border:1px dashed var(--rule);border-radius:6px;padding:9px 10px 6px}
+.triple>.fl{font-weight:700;color:var(--ink)}
+.triple .grid3{grid-template-columns:1fr 1fr 1fr;gap:7px}
+.triple .money{margin-bottom:4px}
+.triple .money .mi input{font-size:15px;padding:8px 6px}
+.triple .money .mu{padding:0 6px;font-size:11px}
+.triple .money .fl{text-align:center;font-size:11px}
+.tsum{text-align:right;font-size:12px;color:var(--ink2);margin-top:2px}
+.tsum b{color:var(--ink);font-variant-numeric:tabular-nums}
+.segs{display:flex;gap:6px}
+.seg{flex:1;border:1px solid var(--rule);background:#fff;border-radius:5px;padding:9px 0;
+  font-size:14px;cursor:pointer;color:var(--ink2)}
+.seg.on{background:var(--ink);color:#fff;border-color:var(--ink);font-weight:700}
+.rolls{display:grid;gap:6px}
+.roll{display:grid;grid-template-columns:52px 1fr 26px 84px;align-items:center;gap:8px;
+  border:1.5px solid var(--red);background:var(--redbg);border-radius:5px;padding:5px 8px}
+.rl{font-size:13px;font-weight:600}
+.roll input{width:100%;border:0;background:transparent;text-align:right;font-size:17px;
+  font-weight:600;font-variant-numeric:tabular-nums;padding:5px 4px;color:var(--ink)}
+.roll input:focus{outline:none}
+.ru{font-size:11px;color:var(--ink2)}
+.rv{font-size:13px;text-align:right;color:var(--ink2);font-variant-numeric:tabular-nums}
+.sub{margin-top:10px;font-size:12px;color:var(--ink2);line-height:1.7}
+.sub b{color:var(--ink);font-variant-numeric:tabular-nums}
+.okbox{background:var(--okbg);border-color:#bcd9cb}
+.ngbox{background:var(--ngbg);border-color:#e6b6ae}
+.diffrow{display:flex;align-items:flex-end;justify-content:space-between;gap:12px;flex-wrap:wrap}
+.dl{font-size:11.5px;color:var(--ink2)}
+.dv{font-size:32px;font-weight:700;font-variant-numeric:tabular-nums;line-height:1.15}
+.dv small{font-size:14px;font-weight:500}
+.dnote{font-size:12px;padding-bottom:6px}
+.okbox .dnote{color:var(--ok)}
+.ngbox .dnote{color:var(--red);font-weight:700}
+.staffrow{display:grid;grid-template-columns:1fr 68px 14px 68px 30px;gap:6px;align-items:center;
+  margin-bottom:6px}
+.staffrow input{border:1px solid var(--rule);border-radius:5px;padding:8px;font-size:15px;width:100%}
+.tilde{text-align:center;color:var(--ink2);font-size:12px}
+.x{border:1px solid var(--rule);background:#fff;border-radius:5px;padding:8px 0;cursor:pointer;
+  color:var(--ink2)}
+.ghost{border:1px solid var(--rule);background:#fff;border-radius:6px;padding:10px 16px;
+  font-size:13px;cursor:pointer;color:var(--ink)}
+.sum .srow{display:flex;justify-content:space-between;padding:7px 2px;font-size:13.5px;
+  border-bottom:1px dotted var(--rule)}
+.sum .sv{font-variant-numeric:tabular-nums}
+.sum .st{font-weight:700;background:#faf7ee}
+.sum hr{border:0;border-top:2px solid var(--ink);margin:10px 0}
+.actions{display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin:14px 0}
+.primary{border:0;background:var(--ink);color:#fff;border-radius:6px;padding:12px 22px;
+  font-size:14px;font-weight:700;cursor:pointer}
+.primary.alt{background:var(--red)}
+.hist{border:1px solid var(--rule);border-radius:6px;padding:10px;font-size:13px;background:#fff}
+.foot{font-size:11px;color:var(--ink2);text-align:center}
+
+/* ── 日報 ── */
+.sheet{background:#fff;border:1px solid #999;padding:14px 16px;
+  font-family:"Hiragino Mincho ProN","Yu Mincho",YuMincho,serif;color:#111}
+.sh-head{display:flex;align-items:flex-start;justify-content:space-between}
+.sh-title{display:flex;align-items:baseline;gap:6px}
+.store{font-size:26px;font-weight:700;letter-spacing:.4em}
+.sh-title .small{font-size:11px}
+.ttl{font-size:24px;font-weight:700;letter-spacing:.3em;margin-left:6px}
+.chk{border-collapse:collapse;font-size:10px;text-align:center}
+.chk td{border:1px solid #333;width:52px;padding:2px}
+.chk td.h{height:26px}
+.sh-date{font-size:13px;margin:6px 0 12px;letter-spacing:.05em}
+.sh-date u{padding:0 6px;text-decoration:none;border-bottom:1px solid #333}
+.wsel{font-weight:700;background:#fff2a8;padding:0 2px;border-radius:2px}
+.cols{display:grid;grid-template-columns:1fr 1fr;gap:14px;margin-bottom:10px;align-items:start}
+.cap{font-size:11px;font-weight:700;margin:0 0 3px}
+.tb{width:100%;border-collapse:collapse;font-size:11px}
+.tb th,.tb td{border:1px solid #333;padding:3px 5px;height:21px}
+.tb th{font-weight:400;text-align:left;white-space:nowrap}
+.tb th.c{text-align:center}
+.tb .num{text-align:right;font-variant-numeric:tabular-nums;
+  font-family:"Hiragino Sans","Yu Gothic",sans-serif;min-width:88px}
+.tb .b{font-weight:700}
+.vert{width:16px;text-align:center;padding:0 2px;font-size:10px}
+.staff td{height:21px;font-size:10px;color:#444}
+.note{font-size:9.5px;margin-top:2px}
+.total{border:2px solid #333;padding:6px 8px;margin-bottom:6px}
+.tl{font-size:11px;font-weight:700}
+.tv{font-size:22px;text-align:right;font-variant-numeric:tabular-nums;
+  font-family:"Hiragino Sans","Yu Gothic",sans-serif;font-weight:700}
+.memo{margin-top:4px}
+.memoc{height:24px}
+.memoc.r{text-align:right;font-size:10px}
+
+@media(max-width:560px){
+  .grid2{grid-template-columns:1fr}
+  .cols{grid-template-columns:1fr}
+  .wrap{padding:12px 10px 60px}
+}
+@media print{
+  .no-print{display:none!important}
+  .app{background:#fff}
+  .wrap{max-width:none;padding:0}
+  .sheet{border:0;padding:0}
+  @page{size:A4 portrait;margin:10mm}
+  .cols{grid-template-columns:1fr 1fr}
+}
+`;
+
+
+ReactDOM.createRoot(document.getElementById("root")).render(<App />);
+</script>
+</body>
+</html>
