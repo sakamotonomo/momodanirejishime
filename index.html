@@ -113,31 +113,8 @@ const lastYearISO = (iso) => {
   return `${y - 1}-${String(m).padStart(2, "0")}-${String(d).padStart(2, "0")}`;
 };
 
-function App() {
-  const [tab, setTab] = useState("input");
-  const [f, setF] = useState(blank());
-  const [saved, setSaved] = useState([]);
-  const [status, setStatus] = useState("");
-  const statusTimer = useRef(null);
-
-  const set = (k) => (e) => setF((p) => ({ ...p, [k]: e.target.value }));
-  const setRoll = (k) => (e) =>
-    setF((p) => ({ ...p, rolls: { ...p.rolls, [k]: e.target.value } }));
-  const setAt = (k, i) => (e) =>
-    setF((p) => {
-      const a = arr3(p[k]);
-      a[i] = e.target.value;
-      return { ...p, [k]: a };
-    });
-
-  const flash = (msg) => {
-    setStatus(msg);
-    clearTimeout(statusTimer.current);
-    statusTimer.current = setTimeout(() => setStatus(""), 2600);
-  };
-
-  /* ── 計算 ── */
-  const c = useMemo(() => {
+/* 1日分の入力から日報の数値を計算する（保存データの集計でも使います） */
+function calc(f) {
     const rollTotal = ROLLS.reduce((s, r) => s + r.per * n(f.rolls[r.key]), 0);
     const cashless = n(f.credit) + n(f.icoca) + n(f.paypay) + n(f.offline);
     const gift = n(f.points) * POINT_UNIT;
@@ -197,7 +174,32 @@ function App() {
       cumRatio:
         n(f.lastYearCum) > 0 ? (n(f.thisYearCum) / n(f.lastYearCum)) * 100 : null,
     };
-  }, [f]);
+}
+
+function App() {
+  const [tab, setTab] = useState("input");
+  const [f, setF] = useState(blank());
+  const [saved, setSaved] = useState([]);
+  const [status, setStatus] = useState("");
+  const statusTimer = useRef(null);
+
+  const set = (k) => (e) => setF((p) => ({ ...p, [k]: e.target.value }));
+  const setRoll = (k) => (e) =>
+    setF((p) => ({ ...p, rolls: { ...p.rolls, [k]: e.target.value } }));
+  const setAt = (k, i) => (e) =>
+    setF((p) => {
+      const a = arr3(p[k]);
+      a[i] = e.target.value;
+      return { ...p, [k]: a };
+    });
+
+  const flash = (msg) => {
+    setStatus(msg);
+    clearTimeout(statusTimer.current);
+    statusTimer.current = setTimeout(() => setStatus(""), 2600);
+  };
+
+  const c = useMemo(() => calc(f), [f]);
 
   /* ── 保存・読込 ── */
   const loadIndex = async () => {
@@ -268,6 +270,9 @@ function App() {
           </button>
           <button className={tab === "report" ? "tab on" : "tab"} onClick={() => setTab("report")}>
             日報
+          </button>
+          <button className={tab === "sum" ? "tab on" : "tab"} onClick={() => setTab("sum")}>
+            年集計
           </button>
         </nav>
       </header>
@@ -527,6 +532,8 @@ function App() {
             保存したデータはこの端末のこのアプリ内にだけ残ります。
           </p>
         </main>
+      ) : tab === "sum" ? (
+        <Summary onBack={() => setTab("input")} />
       ) : (
         <main className="wrap">
           <div className="actions no-print">
@@ -788,6 +795,362 @@ function App() {
   );
 }
 
+/* ── 年集計：保存した日報を「同じ期間・年ごと」に合計します ── */
+const pad2 = (v) => String(v).padStart(2, "0");
+const mdList = (y, fm, fd, tm, td) => {
+  const out = [];
+  const end = new Date(y, tm - 1, td);
+  for (let dt = new Date(y, fm - 1, fd); dt <= end; dt.setDate(dt.getDate() + 1)) {
+    out.push(`${dt.getFullYear()}-${pad2(dt.getMonth() + 1)}-${pad2(dt.getDate())}`);
+  }
+  return out;
+};
+
+function Summary({ onBack }) {
+  const [rows, setRows] = useState(null);
+  const [fm, setFm] = useState("9");
+  const [fd, setFd] = useState("1");
+  const [tm, setTm] = useState("9");
+  const [td, setTd] = useState("13");
+  const [open, setOpen] = useState({});
+  const [csv, setCsv] = useState("");
+
+  useEffect(() => {
+    let alive = true;
+    (async () => {
+      const out = [];
+      try {
+        const r = await store.list("nippo:");
+        for (const k of (r && r.keys) || []) {
+          try {
+            const g = await store.get(k);
+            const data = JSON.parse(g.value);
+            const date = /^\d{4}-\d{2}-\d{2}$/.test(data.date || "")
+              ? data.date
+              : k.replace("nippo:", "");
+            if (/^\d{4}-\d{2}-\d{2}$/.test(date)) out.push({ date, data });
+          } catch (e) {
+            /* 壊れたデータは飛ばす */
+          }
+        }
+      } catch (e) {
+        /* まだ保存がない */
+      }
+      out.sort((a, b) => (a.date < b.date ? -1 : 1));
+      if (alive) setRows(out);
+    })();
+    return () => {
+      alive = false;
+    };
+  }, []);
+
+  /* 期間（月日）。逆順に入れても入れ替えて扱います */
+  const range = useMemo(() => {
+    const clamp = (v, lo, hi) => Math.min(Math.max(Math.round(n(v)) || lo, lo), hi);
+    let a = { m: clamp(fm, 1, 12), d: clamp(fd, 1, 31) };
+    let b = { m: clamp(tm, 1, 12), d: clamp(td, 1, 31) };
+    if (a.m * 100 + a.d > b.m * 100 + b.d) [a, b] = [b, a];
+    return { fm: a.m, fd: a.d, tm: b.m, td: b.d, lo: a.m * 100 + a.d, hi: b.m * 100 + b.d };
+  }, [fm, fd, tm, td]);
+
+  const years = useMemo(() => {
+    if (!rows) return null;
+    const map = new Map();
+    rows.forEach((r) => {
+      const [y, m, d] = r.date.split("-").map(Number);
+      const key = m * 100 + d;
+      if (key < range.lo || key > range.hi) return;
+      if (!map.has(y)) map.set(y, []);
+      map.get(y).push({ date: r.date, m, d, c: calc(r.data), data: r.data });
+    });
+    const list = [...map.entries()].map(([year, days]) => {
+      days.sort((a, b) => (a.date < b.date ? -1 : 1));
+      const t = days.reduce(
+        (s, x) => ({
+          net: s.net + x.c.net,
+          totalIncl: s.totalIncl + x.c.totalIncl,
+          guests: s.guests + x.c.guests,
+          cashless: s.cashless + x.c.cashless,
+          gift: s.gift + x.c.gift,
+          shop: s.shop + x.c.shopTotal,
+          toHQ: s.toHQ + x.c.toHQ,
+          diff: s.diff + x.c.diff,
+        }),
+        { net: 0, totalIncl: 0, guests: 0, cashless: 0, gift: 0, shop: 0, toHQ: 0, diff: 0 }
+      );
+      const have = new Set(days.map((x) => x.date));
+      const today = todayISO();
+      const missing = mdList(year, range.fm, range.fd, range.tm, range.td).filter(
+        (d) => !have.has(d) && d <= today
+      );
+      return { year, days, ...t, avg: t.guests > 0 ? t.net / t.guests : null, missing };
+    });
+    list.sort((a, b) => b.year - a.year);
+    const byYear = new Map(list.map((x) => [x.year, x]));
+    list.forEach((x) => {
+      const p = byYear.get(x.year - 1);
+      x.prev = p || null;
+      x.netRatio = p && p.net > 0 ? (x.net / p.net) * 100 : null;
+      x.guestRatio = p && p.guests > 0 ? (x.guests / p.guests) * 100 : null;
+    });
+    return list;
+  }, [rows, range]);
+
+  const label = `${range.fm}月${range.fd}日 〜 ${range.tm}月${range.td}日`;
+
+  const makeCsv = () => {
+    const head = [
+      "年", "記録日数", "売上（税抜）", "前年対比%", "客数", "客単価",
+      "税込売上", "キャッシュレス", "金券", "材料・その他", "本社入金額", "過不足",
+    ];
+    const body = (years || []).map((y) => [
+      y.year, y.days.length, y.net,
+      y.netRatio != null ? y.netRatio.toFixed(1) : "",
+      y.guests, y.avg != null ? Math.round(y.avg) : "",
+      y.totalIncl, y.cashless, y.gift, y.shop, y.toHQ, y.diff,
+    ]);
+    setCsv([`桃谷本店 ${label} 年集計`, head.join(","), ...body.map((r) => r.join(","))].join("\n"));
+  };
+
+  return (
+    <main className="wrap">
+      <section className="card no-print">
+        <h2>
+          集計する期間<span className="hint">年をまたいで同じ月日を比べます</span>
+        </h2>
+        <div className="mdrow">
+          <span className="mdi">
+            <input type="number" inputMode="numeric" value={fm} onChange={(e) => setFm(e.target.value)} />
+            <em>月</em>
+            <input type="number" inputMode="numeric" value={fd} onChange={(e) => setFd(e.target.value)} />
+            <em>日</em>
+          </span>
+          <span className="tilde">〜</span>
+          <span className="mdi">
+            <input type="number" inputMode="numeric" value={tm} onChange={(e) => setTm(e.target.value)} />
+            <em>月</em>
+            <input type="number" inputMode="numeric" value={td} onChange={(e) => setTd(e.target.value)} />
+            <em>日</em>
+          </span>
+        </div>
+        <div className="presets">
+          {[
+            { t: "9/1〜9/13", v: [9, 1, 9, 13] },
+            { t: "今月1日〜今日", v: null },
+          ].map((p) => (
+            <button
+              key={p.t}
+              className="ghost small"
+              onClick={() => {
+                if (p.v) {
+                  setFm(String(p.v[0])); setFd(String(p.v[1]));
+                  setTm(String(p.v[2])); setTd(String(p.v[3]));
+                } else {
+                  const d = new Date();
+                  setFm(String(d.getMonth() + 1)); setFd("1");
+                  setTm(String(d.getMonth() + 1)); setTd(String(d.getDate()));
+                }
+              }}
+            >
+              {p.t}
+            </button>
+          ))}
+        </div>
+      </section>
+
+      <div className="sheet">
+        <div className="sh-head">
+          <div className="sh-title">
+            <span className="store">桃谷</span>
+            <span className="small">店</span>
+            <span className="ttl">年集計</span>
+          </div>
+        </div>
+        <div className="sh-date">
+          期間 <u>{label}</u>　（保存した日報から集計）
+        </div>
+
+        {years == null ? (
+          <p className="empty">読み込んでいます…</p>
+        ) : years.length === 0 ? (
+          <p className="empty">
+            この期間に保存された日報がありません。「入力」で日報を保存すると、ここに年ごとの合計が出ます。
+          </p>
+        ) : (
+          <>
+            <div className="scrollx">
+              <table className="tb ysum">
+                <thead>
+                  <tr>
+                    <th className="c">年</th>
+                    <th className="c">日数</th>
+                    <th className="c">売上（税抜）</th>
+                    <th className="c">前年対比</th>
+                    <th className="c">客数</th>
+                    <th className="c">客単価</th>
+                    <th className="c">税込売上</th>
+                    <th className="c">キャッシュレス</th>
+                    <th className="c">過不足</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {years.map((y) => (
+                    <tr key={y.year}>
+                      <th className="c b yy">
+                        {y.year}
+                        <small>年</small>
+                      </th>
+                      <td className="num">{y.days.length}</td>
+                      <td className="num b">{yen(y.net)}</td>
+                      <td className={"num " + (y.netRatio != null && y.netRatio < 100 ? "dn" : "up")}>
+                        {y.netRatio != null ? `${y.netRatio.toFixed(1)} %` : "—"}
+                      </td>
+                      <td className="num">{yen(y.guests)}</td>
+                      <td className="num">{y.avg != null ? yen(Math.round(y.avg)) : "—"}</td>
+                      <td className="num">{yen(y.totalIncl)}</td>
+                      <td className="num">{yen(y.cashless)}</td>
+                      <td className="num">
+                        {y.diff > 0 ? "＋" : y.diff < 0 ? "−" : ""}
+                        {yen(Math.abs(y.diff))}
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+
+            {years.map((y) => (
+              <div className="ybox" key={y.year}>
+                <div className="ycap">
+                  {y.year}年 {label}　<span className="ysub">{y.days.length}日分</span>
+                  <button
+                    className="ghost small no-print"
+                    onClick={() => setOpen((p) => ({ ...p, [y.year]: !p[y.year] }))}
+                  >
+                    {open[y.year] ? "日別を閉じる" : "日別を見る"}
+                  </button>
+                </div>
+                <div className="scrollx">
+                <table className="tb ydetail">
+                  <tbody>
+                    <tr>
+                      <th>売上（税抜）Ａ＋Ｂ</th>
+                      <td className="num b">¥ {yen(y.net)}</td>
+                      <th>客数</th>
+                      <td className="num">{yen(y.guests)} 人</td>
+                    </tr>
+                    <tr>
+                      <th>税込売上（差引①）</th>
+                      <td className="num">¥ {yen(y.totalIncl)}</td>
+                      <th>客単価（税抜）</th>
+                      <td className="num">{y.avg != null ? `¥ ${yen(Math.round(y.avg))}` : "—"}</td>
+                    </tr>
+                    <tr>
+                      <th>キャッシュレス計</th>
+                      <td className="num">¥ {yen(y.cashless)}</td>
+                      <th>金券　他</th>
+                      <td className="num">¥ {yen(y.gift)}</td>
+                    </tr>
+                    <tr>
+                      <th>材料・その他</th>
+                      <td className="num">¥ {yen(y.shop)}</td>
+                      <th>本社入金額</th>
+                      <td className="num">¥ {yen(y.toHQ)}</td>
+                    </tr>
+                    <tr>
+                      <th>1日平均（税抜）</th>
+                      <td className="num">
+                        {y.days.length ? `¥ ${yen(Math.round(y.net / y.days.length))}` : "—"}
+                      </td>
+                      <th>前年対比（客数）</th>
+                      <td className="num">
+                        {y.guestRatio != null ? `${y.guestRatio.toFixed(1)} %` : "—"}
+                      </td>
+                    </tr>
+                  </tbody>
+                </table>
+                </div>
+                {y.missing.length > 0 && (
+                  <div className="note miss">
+                    記録なし（{y.missing.length}日）：
+                    {y.missing
+                      .map((d) => {
+                        const p = d.split("-").map(Number);
+                        return `${p[1]}/${p[2]}`;
+                      })
+                      .join("・")}
+                  </div>
+                )}
+                {open[y.year] && (
+                  <div className="scrollx">
+                    <table className="tb">
+                      <thead>
+                        <tr>
+                          <th className="c">日付</th>
+                          <th className="c">売上（税抜）</th>
+                          <th className="c">客数</th>
+                          <th className="c">客単価</th>
+                          <th className="c">税込売上</th>
+                          <th className="c">過不足</th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {y.days.map((x) => {
+                          const jd = jpDate(x.date);
+                          return (
+                            <tr key={x.date}>
+                              <th className="c">
+                                {jd.m}/{jd.d}（{jd.w}）
+                              </th>
+                              <td className="num">{yen(x.c.net)}</td>
+                              <td className="num">{yen(x.c.guests)}</td>
+                              <td className="num">
+                                {x.c.guests > 0 ? yen(Math.round(x.c.net / x.c.guests)) : "—"}
+                              </td>
+                              <td className="num">{yen(x.c.totalIncl)}</td>
+                              <td className="num">
+                                {x.c.diff > 0 ? "＋" : x.c.diff < 0 ? "−" : ""}
+                                {yen(Math.abs(x.c.diff))}
+                              </td>
+                            </tr>
+                          );
+                        })}
+                      </tbody>
+                    </table>
+                  </div>
+                )}
+              </div>
+            ))}
+          </>
+        )}
+      </div>
+
+      <div className="actions no-print">
+        <button className="primary" onClick={() => window.print()}>
+          印刷する
+        </button>
+        <button className="ghost" onClick={makeCsv}>
+          CSVを作る
+        </button>
+        <button className="ghost" onClick={onBack}>
+          入力に戻る
+        </button>
+      </div>
+      {csv && (
+        <section className="card no-print">
+          <h2>
+            CSV<span className="hint">長押し（または Ctrl+A）で全部選んでコピーできます</span>
+          </h2>
+          <textarea className="csv" readOnly value={csv} onFocus={(e) => e.target.select()} rows={Math.min(12, csv.split("\n").length + 1)} />
+        </section>
+      )}
+      <p className="foot no-print">
+        この端末に保存された日報だけを集計します。
+      </p>
+    </main>
+  );
+}
+
 function cellStaff(s) {
   if (!s || (!s.name && !s.from && !s.to)) return "（　　〜　　）";
   return `${s.name}（${s.from || "　"}〜${s.to || "　"}）`;
@@ -958,6 +1321,33 @@ const CSS = `
 .memoc{height:24px}
 .memoc.r{text-align:right;font-size:10px}
 
+
+/* ── 年集計 ── */
+.mdrow{display:flex;align-items:center;gap:10px;flex-wrap:wrap}
+.mdi{display:inline-flex;align-items:center;gap:4px;border:1.5px solid var(--red);
+  background:var(--redbg);border-radius:5px;padding:4px 8px}
+.mdi input{width:54px;border:0;background:transparent;text-align:right;font-size:17px;
+  font-weight:600;font-variant-numeric:tabular-nums;color:var(--ink);padding:4px 2px}
+.mdi input:focus{outline:none}
+.mdi em{font-style:normal;font-size:12px;color:var(--ink2)}
+.presets{display:flex;gap:8px;flex-wrap:wrap;margin-top:10px}
+.ghost.small{padding:7px 12px;font-size:12px}
+.scrollx{overflow-x:auto;-webkit-overflow-scrolling:touch;margin-bottom:10px}
+.tb.ysum{min-width:640px}
+.tb.ydetail{min-width:430px}
+.tb.ysum thead th{background:#f2efe6;font-size:10.5px;font-weight:700}
+.yy small{font-size:9px;font-weight:400;margin-left:1px}
+.tb .up{color:#1f5c44}
+.tb .dn{color:var(--red)}
+.ybox{margin:14px 0 4px;page-break-inside:avoid}
+.ycap{display:flex;align-items:center;gap:10px;font-size:11px;font-weight:700;margin:0 0 3px}
+.ysub{font-weight:400;color:#555}
+.note.miss{font-size:9.5px;color:#666;margin:2px 0 0}
+.empty{font-size:12px;color:#555;line-height:1.8;
+  font-family:"Hiragino Sans","Yu Gothic",sans-serif}
+.csv{width:100%;border:1px solid var(--rule);border-radius:5px;padding:8px;font-size:12px;
+  font-family:ui-monospace,SFMono-Regular,Menlo,monospace;background:#fff;color:var(--ink)}
+
 @media(max-width:560px){
   .grid2{grid-template-columns:1fr}
   .cols{grid-template-columns:1fr}
@@ -965,6 +1355,9 @@ const CSS = `
 }
 @media print{
   .no-print{display:none!important}
+  .scrollx{overflow:visible}
+  .tb.ysum,.tb.ydetail{min-width:0}
+  .ybox{margin:10px 0 2px}
   .app{background:#fff}
   .wrap{max-width:none;padding:0}
   .sheet{border:0;padding:0}
